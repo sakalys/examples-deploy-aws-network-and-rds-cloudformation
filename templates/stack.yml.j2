@@ -1,0 +1,1831 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+Description: Microtrader Stack
+
+Parameters:
+  EcsTaskRunnerVersion:
+    Type: String
+    Description: S3 Object Version of CloudFormation ECS Tasks function
+  MicrotraderImage:
+    Type: String
+    Description: Microtrader Docker Image Registry/Organization Base URI
+    Default: 543279062384.dkr.ecr.us-west-2.amazonaws.com/dockerproductionaws
+  MicrotraderImageTag:
+    Type: String
+    Description: Microtrader Docker Image Application Tag
+    Default: latest
+  LogRetention:
+    Type: Number
+    Description: Log Retention (Days)
+    Default: 7
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1827, 3653]
+  DatabaseMultiAZ:
+    Type: String
+    Description: Enable or disable RDS Multi Availability Zone
+    Default: "false"
+    AllowedValues:
+      - "true"
+      - "false"
+  DatabaseInstanceType:
+    Type: String
+    Description: Database instance type
+    Default: db.t2.micro
+    AllowedValues:
+      - db.t2.micro
+      - db.t2.small
+      - db.t2.medium
+  DatabaseName:
+    Type: String
+    Description: Database name
+  DatabaseUsername:
+    Type: String
+    Description: Database username
+  DatabasePassword:
+    Type: String
+    Description: Database password
+    NoEcho: true
+  ApplicationDnsName:
+    Type: String
+    Description: Hostname portion of application FQDN
+  ApplicationDesiredCount:
+    Type: Number
+    Description: The desired number of application instances
+    Default: 1
+  ApplicationImageId:
+    Type: String
+    Description: Amazon machine image ID
+  ApplicationKeyName:
+    Type: String
+    Description: EC2 key pair for SSH access
+  ApplicationInstanceType:
+    Type: String
+    Description: Application EC2 instance type
+    Default: t2.micro
+    AllowedValues:
+      - t2.micro
+      - t2.small
+      - t2.medium
+  MicrotraderDashboardHttpPort:
+    Type: Number
+    Description: Container port for Microtrader Dashboard
+  MicrotraderAuditHttpPort:
+    Type: Number
+    Description: Container port for Microtrader Audit Service
+  MicrotraderQuoteHttpPort:
+    Type: Number
+    Description: Container port for Microtrader Quote Service
+  VpcName:
+    Type: String
+    Description: Name of the target VPC
+    Default: Default
+
+Conditions:
+  DatabaseSingleAZCondition:
+    Fn::Equals:
+      - Ref: DatabaseMultiAZ
+      - "false"
+  ApplicationSingleInstanceCondition:
+    Fn::Equals:
+      - Ref: ApplicationDesiredCount
+      - 1
+
+Resources:
+  AuditServiceAutoscalingScaleInPolicy:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: ScaleIn
+      PolicyType: StepScaling
+      ScalingTargetId:
+        Ref: AuditServiceAutoscalingTarget
+      StepScalingPolicyConfiguration:
+        AdjustmentType: ChangeInCapacity
+        Cooldown: 360
+        MetricAggregationType: Average
+        StepAdjustments:
+        - ScalingAdjustment: -1
+          MetricIntervalUpperBound: 0
+  AuditServiceAutoscalingScaleOutPolicy:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: ScaleOut
+      PolicyType: StepScaling
+      ScalingTargetId:
+        Ref: AuditServiceAutoscalingTarget
+      StepScalingPolicyConfiguration:
+        AdjustmentType: ChangeInCapacity
+        Cooldown: 360
+        MetricAggregationType: Average
+        StepAdjustments:
+        - ScalingAdjustment: 1
+          MetricIntervalLowerBound: 0
+  AuditServiceAutoscalingRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Action:
+              - sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service: application-autoscaling.amazonaws.com
+      Policies:
+        - PolicyName: AutoscalingPermissions
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                - application-autoscaling:DescribeScalableTargets
+                - application-autoscaling:DescribeScalingActivities
+                - application-autoscaling:DescribeScalingPolicies
+                - cloudwatch:DescribeAlarms
+                - cloudwatch:PutMetricAlarm
+                - ecs:DescribeServices
+                - ecs:UpdateService
+                Resource: "*"
+  AuditServiceAutoscalingTarget:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    Properties:
+      ServiceNamespace: ecs
+      ResourceId:
+        Fn::Sub: service/${ApplicationCluster}/${AuditService.Name}
+      ScalableDimension: ecs:service:DesiredCount
+      MinCapacity: 1
+      MaxCapacity: 4
+      RoleARN:
+        Fn::Sub: ${AuditServiceAutoscalingRole.Arn}
+  AuditServiceLowCpuAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmActions:
+        - Ref: AuditServiceAutoscalingScaleInPolicy
+      AlarmDescription: Audit Service Low CPU 
+      Namespace: AWS/ECS
+      Dimensions:
+        - Name: ClusterName
+          Value:
+            Ref: ApplicationCluster
+        - Name: ServiceName
+          Value:
+            Fn::Sub: ${AuditService.Name}
+      MetricName: CPUUtilization
+      Statistic: Average
+      Period: 60
+      EvaluationPeriods: 3
+      Threshold: 25
+      ComparisonOperator: LessThanThreshold
+  AuditServiceHighCpuAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmActions:
+        - Ref: AuditServiceAutoscalingScaleOutPolicy
+      AlarmDescription: Audit Service High CPU
+      Namespace: AWS/ECS
+      Dimensions:
+        - Name: ClusterName
+          Value:
+            Ref: ApplicationCluster
+        - Name: ServiceName
+          Value:
+            Fn::Sub: ${AuditService.Name}
+      MetricName: CPUUtilization
+      Statistic: Average
+      Period: 60
+      EvaluationPeriods: 3
+      Threshold: 50
+      ComparisonOperator: GreaterThanThreshold
+  ApplicationAutoscalingScaleOutPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      PolicyType: SimpleScaling
+      AdjustmentType: ChangeInCapacity
+      ScalingAdjustment: 1
+      AutoScalingGroupName:
+        Ref: ApplicationAutoscaling
+      Cooldown: 600
+  ApplicationAutoscalingScaleInPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      PolicyType: SimpleScaling
+      AdjustmentType: ChangeInCapacity
+      ScalingAdjustment: -1
+      AutoScalingGroupName:
+        Ref: ApplicationAutoscaling
+      Cooldown: 600
+  ContainerCapacityAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: ECS Cluster Container Free Capacity
+      AlarmActions:
+        - Ref: ApplicationAutoscalingScaleOutPolicy
+      Namespace: AWS/ECS
+      Dimensions:
+        - Name: ClusterName
+          Value:
+            Ref: ApplicationCluster
+      MetricName: ContainerCapacity
+      Statistic: Minimum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: LessThanThreshold
+      TreatMissingData: ignore
+  IdleHostCapacityAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: ECS Cluster Container Free Capacity
+      AlarmActions:
+        - Ref: ApplicationAutoscalingScaleInPolicy
+      Namespace: AWS/ECS
+      Dimensions:
+        - Name: ClusterName
+          Value:
+            Ref: ApplicationCluster
+      MetricName: IdleHostCapacity
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: ignore
+  EcsCapacityPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName:
+        Ref: EcsCapacityFunction
+      Principal: events.amazonaws.com
+      SourceArn:
+        Fn::Sub: ${EcsCapacityEvents.Arn}
+  EcsCapacityEvents:
+    Type: AWS::Events::Rule
+    Properties:
+      Description:
+        Fn::Sub: ${AWS::StackName} ECS Events Rule
+      EventPattern:
+        source:
+          - aws.ecs
+        detail-type:
+          - ECS Container Instance State Change
+        detail:
+          clusterArn:
+            - Fn::Sub: arn:aws:ecs:${AWS::Region}:${AWS::AccountId}:cluster/${ApplicationCluster}
+      Targets:
+        - Arn:
+            Fn::Sub: ${EcsCapacityFunction.Arn}
+          Id:
+            Fn::Sub: ${AWS::StackName}-ecs-events
+  EcsCapacityRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Action:
+              - sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+      Policies:
+        - PolicyName: EcsCapacityPermissions
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: PublishCloudwatchMetrics
+                Effect: Allow
+                Action:
+                  - cloudwatch:putMetricData
+                Resource: "*"
+              - Sid: ListContainerInstances
+                Effect: Allow
+                Action:
+                  - ecs:ListContainerInstances
+                Resource:
+                  Fn::Sub: arn:aws:ecs:${AWS::Region}:${AWS::AccountId}:cluster/${ApplicationCluster}
+              - Sid: DescribeContainerInstances
+                Effect: Allow
+                Action:
+                  - ecs:DescribeContainerInstances
+                Resource: "*"
+                Condition:
+                  ArnEquals:
+                    ecs:cluster:
+                      Fn::Sub: arn:aws:ecs:${AWS::Region}:${AWS::AccountId}:cluster/${ApplicationCluster}
+              - Sid: ManageLambdaLogs
+                Effect: Allow
+                Action:
+                - logs:CreateLogStream
+                - logs:PutLogEvents
+                Resource:
+                  Fn::Sub: ${EcsCapacityLogGroup.Arn}
+  EcsCapacityFunction:
+    Type: AWS::Lambda::Function
+    DependsOn:
+      - EcsCapacityLogGroup
+    Properties:
+      Role:
+        Fn::Sub: ${EcsCapacityRole.Arn}
+      FunctionName:
+        Fn::Sub: ${AWS::StackName}-ecsCapacity
+      Description:
+        Fn::Sub: ${AWS::StackName} ECS Capacity Manager
+      Code:
+        S3Bucket:
+          Fn::ImportValue: CfnLambdaBucket
+        S3Key: ecsCapacity.zip
+      Runtime: python2.7
+      MemorySize: 128
+      Timeout: 300
+      Handler: ecs_capacity.handler
+      Environment:
+        Variables:
+          CONTAINER_MAX_CPU: 200
+          CONTAINER_MAX_MEMORY: 195
+          TCP_PORT_RESOURCES:
+            Fn::Sub: ${MicrotraderQuoteHttpPort},${MicrotraderAuditHttpPort},${MicrotraderDashboardHttpPort},15701,15702,15703,15704
+  EcsCapacityLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    Properties:
+      LogGroupName:
+        Fn::Sub: /aws/lambda/${AWS::StackName}-ecsCapacity
+      RetentionInDays:
+        Ref: LogRetention
+  LifecycleHookSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Endpoint:
+        Fn::Sub: ${LifecycleHookFunction.Arn}
+      Protocol: lambda
+      TopicArn:
+        Ref: LifecycleHookTopic
+  LifecycleHookPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName:
+        Ref: LifecycleHookFunction
+      Principal: sns.amazonaws.com
+      SourceArn:
+        Ref: LifecycleHookTopic
+  LifecycleFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Action:
+              - sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+      Policies:
+        - PolicyName: LifecycleHookPermissions
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: Publish
+                Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource:
+                  Ref: LifecycleHookTopic
+              - Sid: CompleteLifecycleAction
+                Effect: Allow
+                Action:
+                  - autoscaling:CompleteLifecycleAction
+                Resource:
+                  Fn::Sub: arn:aws:autoscaling:${AWS::Region}:${AWS::AccountId}:autoScalingGroup:*:autoScalingGroupName/${ApplicationAutoscaling}
+              - Sid: ListContainerInstances
+                Effect: Allow
+                Action:
+                  - ecs:ListContainerInstances
+                Resource:
+                  Fn::Sub: arn:aws:ecs:${AWS::Region}:${AWS::AccountId}:cluster/${ApplicationCluster}
+              - Sid: ManageContainerInstances
+                Effect: Allow
+                Action:
+                  - ecs:DescribeContainerInstances
+                  - ecs:UpdateContainerInstancesState
+                Resource: "*"
+                Condition:
+                  ArnEquals:
+                    ecs:cluster:
+                      Fn::Sub: arn:aws:ecs:${AWS::Region}:${AWS::AccountId}:cluster/${ApplicationCluster}
+              - Sid: ManageLambdaLogs
+                Effect: Allow
+                Action:
+                - logs:CreateLogStream
+                - logs:PutLogEvents
+                Resource:
+                  Fn::Sub: ${LifecycleHookFunctionLogGroup.Arn}
+  LifecycleHookFunction:
+    Type: AWS::Lambda::Function
+    DependsOn:
+      - LifecycleHookFunctionLogGroup
+    Properties:
+      Role:
+        Fn::Sub: ${LifecycleFunctionRole.Arn}
+      FunctionName:
+        Fn::Sub: ${AWS::StackName}-lifecycleHooks
+      Description:
+        Fn::Sub: ${AWS::StackName} Autoscaling Lifecycle Hook
+      Code:
+        S3Bucket:
+          Fn::ImportValue: CfnLambdaBucket
+        S3Key: lifecycleHooks.zip
+      Runtime: python2.7
+      MemorySize: 128
+      Timeout: 30
+      Handler: lifecycle_hooks.handler
+      Environment:
+        Variables:
+          ECS_CLUSTER:
+            Ref: ApplicationCluster
+  LifecycleHookFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    Properties:
+      LogGroupName:
+        Fn::Sub: /aws/lambda/${AWS::StackName}-lifecycleHooks
+      RetentionInDays: 7
+  LifecycleHookTopic:
+    Type: AWS::SNS::Topic
+    Properties: {}
+  LifecycleHookRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Action:
+              - sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service: autoscaling.amazonaws.com
+      Policies:
+        - PolicyName: LifecycleHookPermissions
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+            - Sid: PublishNotifications
+              Action:
+                - sns:Publish
+              Effect: Allow
+              Resource:
+                Ref: LifecycleHookTopic
+  LifecycleHook:
+    Type: AWS::AutoScaling::LifecycleHook
+    Properties:
+      RoleARN:
+        Fn::Sub: ${LifecycleHookRole.Arn}
+      AutoScalingGroupName:
+        Ref: ApplicationAutoscaling
+      DefaultResult: CONTINUE
+      HeartbeatTimeout: 900
+      LifecycleTransition: autoscaling:EC2_INSTANCE_TERMINATING
+      NotificationTargetARN:
+        Ref: LifecycleHookTopic
+  ClusterSecret:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken:
+        Fn::Sub: ${SecretsProvisioner.Arn}
+      Name:
+        Fn::Sub: /${AWS::StackName}/cluster/password
+      Key: CLUSTER_GROUP_PASSWORD
+      KmsKeyId:
+        Fn::ImportValue: CfnMasterKey
+      Trigger: 1
+  DatabaseSecret:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken:
+        Fn::Sub: ${SecretsProvisioner.Arn}
+      Name:
+        Fn::Sub: /${AWS::StackName}/database/password
+      Key: JDBC_PASSWORD
+      Value:
+        Ref: DatabasePassword
+      KmsKeyId:
+        Fn::ImportValue: CfnMasterKey 
+  SecretsProvisionerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: lambda.amazonaws.com
+          Action:
+            - sts:AssumeRole
+      Policies:
+        - PolicyName: SecretsProvisionerPermissions
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+            - Sid: ProvisionSecrets
+              Effect: Allow
+              Action:
+              - ssm:GetParameters
+              - ssm:PutParameter
+              - ssm:DeleteParameter
+              - ssm:AddTagsToResource
+              - ssm:ListTagsForResource
+              Resource:
+                Fn::Sub: arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${AWS::StackName}/*
+            - Sid: Encrypt
+              Effect: Allow
+              Action:
+              - kms:Decrypt
+              - kms:Encrypt
+              Resource:
+                Fn::ImportValue: CfnMasterKeyArn
+            - Sid: ManageLambdaLogs
+              Effect: Allow
+              Action:
+              - logs:CreateLogStream
+              - logs:DescribeLogStreams
+              - logs:PutLogEvents
+              Resource:
+                Fn::Sub: ${SecretsProvisionerLogGroup.Arn}
+  SecretsProvisioner:
+    Type: AWS::Lambda::Function
+    DependsOn:
+      - SecretsProvisionerLogGroup
+    Properties:
+      FunctionName:
+        Fn::Sub: ${AWS::StackName}-secretsProvisioner
+      Description:
+        Fn::Sub: ${AWS::StackName} Secrets Provisioner
+      Handler: secrets_provisioner.handler
+      MemorySize: 128
+      Runtime: python2.7
+      Timeout: 300
+      Code:
+        S3Bucket:
+          Fn::Sub: ${AWS::AccountId}-cfn-lambda
+        S3Key: secretsProvisioner.zip
+      Role:
+        Fn::Sub: ${SecretsProvisionerRole.Arn}
+  SecretsProvisionerLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    Properties:
+      LogGroupName:
+        Fn::Sub: /aws/lambda/${AWS::StackName}-secretsProvisioner
+      RetentionInDays:
+        Ref: LogRetention
+  EcsTaskRunnerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: lambda.amazonaws.com
+          Action:
+            - sts:AssumeRole
+      Policies:
+        - PolicyName: EcsTaskRunnerPermissions
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+            - Sid: InvokeSelf
+              Effect: Allow
+              Action:
+                - lambda:InvokeFunction
+              Resource:
+                Fn::Sub: arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${AWS::StackName}-ecsTasks
+            - Sid: EcsTasks
+              Effect: Allow
+              Action:
+              - ecs:DescribeTasks
+              - ecs:ListTasks
+              - ecs:RunTask
+              - ecs:StartTask
+              - ecs:StopTask
+              - ecs:DescribeContainerInstances
+              - ecs:ListContainerInstances
+              Resource: "*"
+              Condition:
+                ArnEquals:
+                  ecs:cluster: 
+                    Fn::Sub: arn:aws:ecs:${AWS::Region}:${AWS::AccountId}:cluster/${ApplicationCluster}
+            - Sid: ManageLambdaLogs
+              Effect: Allow
+              Action:
+              - logs:CreateLogStream
+              - logs:DescribeLogStreams
+              - logs:PutLogEvents
+              Resource:
+                Fn::Sub:
+                  arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${AWS::StackName}-ecsTasks:*:*
+  EcsTaskRunner:
+    Type: AWS::Lambda::Function
+    DependsOn:
+      - EcsTaskRunnerLogGroup
+    Properties:
+      FunctionName:
+        Fn::Sub: ${AWS::StackName}-ecsTasks
+      Description:
+        Fn::Sub: ${AWS::StackName} ECS Task Runner
+      Handler: ecs_tasks.handler
+      MemorySize: 128
+      Runtime: python2.7
+      Timeout: 300
+      Code:
+        S3Bucket:
+          Fn::Sub: ${AWS::AccountId}-cfn-lambda
+        S3Key: ecsTasks.zip
+        S3ObjectVersion:
+          Ref: EcsTaskRunnerVersion
+      Role:
+        Fn::Sub: ${EcsTaskRunnerRole.Arn}
+  EcsTaskRunnerLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    Properties:
+      LogGroupName:
+        Fn::Sub: /aws/lambda/${AWS::StackName}-ecsTasks
+      RetentionInDays:
+        Ref: LogRetention
+  MigrateTask:
+    Type: AWS::CloudFormation::CustomResource
+    DependsOn:
+      - ApplicationAutoscaling
+      - ApplicationDatabase
+    Properties:
+      ServiceToken:
+        Fn::Sub: ${EcsTaskRunner.Arn}
+      Cluster:
+        Ref: ApplicationCluster
+      TaskDefinition:
+        Ref: MigrateTaskDefinition
+      RunOnUpdate: "true"
+  MigrateTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ecs-tasks.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: SSMSecrets
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                - ssm:GetParameters
+                Resource:
+                  - Fn::Sub: arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${AWS::StackName}/database/password
+              - Effect: Allow
+                Action:
+                - kms:Decrypt
+                Resource:
+                  Fn::ImportValue: CfnMasterKeyArn
+  MigrateTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      TaskRoleArn:
+        Fn::Sub: ${MigrateTaskRole.Arn}
+      NetworkMode: host
+      ContainerDefinitions:
+        - Name: migrate
+          Image:
+            Fn::Sub: ${MicrotraderImage}/microtrader-audit:${MicrotraderImageTag}
+          MemoryReservation: 195
+          Memory: 995
+          Cpu: 200
+          Command:
+            - java
+            - -cp
+            - /app/app.jar
+            - com.pluralsight.dockerproductionaws.admin.Migrate
+          Environment:
+            - Name: SSM_SECRETS
+              Value:
+                Fn::Sub: /${AWS::StackName}/database/password
+            - Name: AWS_DEFAULT_REGION
+              Value:
+                Ref: AWS::Region
+            - Name: HTTPS_PROXY
+              Value:
+                Fn::ImportValue:
+                  Fn::Sub: ${VpcName}ProxyUrl
+            - Name: JDBC_URL
+              Value:
+                Fn::Sub: jdbc:mysql://${ApplicationDatabase.Endpoint.Address}/${DatabaseName}?useSSL=false
+            - Name: JDBC_USER
+              Value:
+                Ref: DatabaseUsername
+            - Name: JDBC_DRIVERCLASS
+              Value: com.mysql.jdbc.Driver
+            - Name: DB_MIGRATIONS_LOCATION
+              Value: db/mysql
+            - Name: JAVA_TOOL_OPTIONS
+              Value:
+                Fn::Join: ["", [
+                  " -Dhttp.proxyHost=", "Fn::ImportValue": { "Fn::Sub": "${VpcName}ProxyHost" },
+                  " -Dhttp.proxyPort=3128",
+                  " -Dhttps.proxyHost=", "Fn::ImportValue": { "Fn::Sub": "${VpcName}ProxyHost" },
+                  " -Dhttps.proxyPort=3128",
+                  " -Dhttp.nonProxyHosts='*.", "Fn::ImportValue": { "Fn::Sub": "${VpcName}VpcDomain" },
+                  "|169.254.*|localhost|127.*|[::1]'"
+                ] ]
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group:
+                Fn::Sub: ${AWS::StackName}/ecs/Tasks/migrate
+              awslogs-region:
+                Ref: AWS::Region
+              awslogs-stream-prefix: docker
+  MigrateLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    Properties:
+      LogGroupName:
+        Fn::Sub: ${AWS::StackName}/ecs/Tasks/migrate
+      RetentionInDays:
+        Ref: LogRetention
+  DashboardService:
+    Type: AWS::ECS::Service
+    DependsOn:
+      - QuoteService
+      - AuditService
+      - PortfolioService
+      - ApplicationAutoscaling
+      - DashboardServiceLogGroup
+      - PublicLoadBalancerHttpListener
+    Properties:
+      LoadBalancers:
+        - ContainerName: dashboard
+          ContainerPort:
+            Ref: MicrotraderDashboardHttpPort
+          TargetGroupArn:
+            Ref: DashboardServiceTargetGroup
+      Role:
+        Ref: EcsServiceRole
+      TaskDefinition:
+        Ref: DashboardTaskDefinition
+      Cluster:
+        Ref: ApplicationCluster
+      DesiredCount:
+        Ref: ApplicationDesiredCount
+      DeploymentConfiguration:
+        MaximumPercent: 200
+        MinimumHealthyPercent: 100
+  PortfolioService:
+    Type: AWS::ECS::Service
+    DependsOn:
+      - AuditService
+      - ApplicationAutoscaling
+      - PortfolioServiceLogGroup
+    Properties:
+      TaskDefinition:
+        Ref: PortfolioTaskDefinition
+      Cluster:
+        Ref: ApplicationCluster
+      DesiredCount: 1
+      DeploymentConfiguration:
+        MaximumPercent: 100
+        MinimumHealthyPercent: 0
+  AuditService:
+    Type: AWS::ECS::Service
+    DependsOn:
+      - ApplicationAutoscaling
+      - AuditServiceLogGroup
+      - ApplicationLoadBalancerHttpListener
+      - ApplicationDatabase
+      - MigrateTask
+    Properties:
+      LoadBalancers:
+        - ContainerName: audit
+          ContainerPort:
+            Ref: MicrotraderAuditHttpPort
+          TargetGroupArn:
+            Ref: AuditServiceTargetGroup
+      Role:
+        Ref: EcsServiceRole
+      DeploymentConfiguration:
+        MaximumPercent: 200
+        MinimumHealthyPercent: 100
+      TaskDefinition:
+        Ref: AuditTaskDefinition
+      Cluster:
+        Ref: ApplicationCluster
+      DesiredCount:
+        Ref: ApplicationDesiredCount
+  EcsServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ecs.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonEC2ContainerServiceRole
+  QuoteService:
+    Type: AWS::ECS::Service
+    DependsOn:
+      - ApplicationAutoscaling
+      - QuoteServiceLogGroup
+      - ApplicationLoadBalancerHttpListener
+    Properties:
+      Role:
+        Ref: EcsServiceRole
+      TaskDefinition:
+        Ref: QuoteTaskDefinition
+      Cluster:
+        Ref: ApplicationCluster
+      DesiredCount: 1
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 0
+        MaximumPercent: 100
+      LoadBalancers:
+        - ContainerName: quote
+          ContainerPort:
+            Ref: MicrotraderQuoteHttpPort
+          TargetGroupArn:
+            Ref: QuoteServiceTargetGroup
+  AuditTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      NetworkMode: host
+      ContainerDefinitions:
+        - Name: audit
+          Image: 
+            Fn::Sub: ${MicrotraderImage}/microtrader-audit:${MicrotraderImageTag}
+          MemoryReservation: 195
+          Memory: 800
+          Cpu: 200
+          Environment:
+            - Name: SSM_SECRETS
+              Value:
+                Fn::Sub: /${AWS::StackName}/database/password /${AWS::StackName}/cluster/password
+            - Name: SSM_VERSIONS
+              Value:
+                Fn::Sub: ${DatabaseSecret} ${ClusterSecret}
+            - Name: AWS_DEFAULT_REGION
+              Value:
+                Ref: AWS::Region
+            - Name: HTTPS_PROXY
+              Value:
+                Fn::ImportValue:
+                  Fn::Sub: ${VpcName}ProxyUrl
+            - Name: JDBC_URL
+              Value:
+                Fn::Sub: jdbc:mysql://${ApplicationDatabase.Endpoint.Address}/${DatabaseName}?useSSL=false
+            - Name: JDBC_USER
+              Value:
+                Ref: DatabaseUsername
+            - Name: JDBC_DRIVERCLASS
+              Value: com.mysql.jdbc.Driver
+            - Name: HTTP_PORT
+              Value:
+                Ref: MicrotraderAuditHttpPort
+            - Name: HTTP_ROOT
+              Value: /audit/
+            - Name: HTTP_HOST
+              Value:
+                Ref: ApplicationDnsRecord
+            - Name: HTTP_PUBLIC_PORT
+              Value: 80
+            - Name: CLUSTER_GROUP_NAME
+              Value:
+                Ref: ApplicationCluster
+            - Name: CLUSTER_AWS_ENABLED
+              Value: "true"
+            - Name: CLUSTER_AWS_REGION
+              Value:
+                Ref: AWS::Region
+            - Name: CLUSTER_AWS_IAM_ROLE
+              Value: DEFAULT
+            - Name: CLUSTER_AWS_TAG_KEY
+              Value: hazelcast:group
+            - Name: CLUSTER_AWS_TAG_VALUE
+              Value:
+                Ref: ApplicationCluster
+            - Name: JAVA_TOOL_OPTIONS
+              Value:
+                Fn::Join: ["", [
+                  " -Dhttp.proxyHost=", "Fn::ImportValue": { "Fn::Sub": "${VpcName}ProxyHost" },
+                  " -Dhttp.proxyPort=3128",
+                  " -Dhttps.proxyHost=", "Fn::ImportValue": { "Fn::Sub": "${VpcName}ProxyHost" },
+                  " -Dhttps.proxyPort=3128",
+                  " -Dhttp.nonProxyHosts='*.", "Fn::ImportValue": { "Fn::Sub": "${VpcName}VpcDomain" },
+                  "|169.254.*|localhost|127.*|[::1]'"
+                ] ]
+          Command:
+            - java
+            - -jar
+            - /app/app.jar
+            - -server
+            - -cluster
+            - -Dvertx.hazelcast.config=/app/conf/cluster.xml
+            - -cluster-port=15704
+          PortMappings:
+            - ContainerPort:
+                Ref: MicrotraderAuditHttpPort
+            - ContainerPort: 15704
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group:
+                Fn::Sub: ${AWS::StackName}/ecs/AuditService/audit
+              awslogs-region:
+                Ref: AWS::Region
+              awslogs-stream-prefix: docker
+  PortfolioTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      NetworkMode: host
+      ContainerDefinitions:
+        - Name: portfolio
+          Image: 
+            Fn::Sub: ${MicrotraderImage}/microtrader-portfolio:${MicrotraderImageTag}
+          MemoryReservation: 195
+          Memory: 800
+          Cpu: 200
+          Environment:
+            - Name: SSM_SECRETS
+              Value:
+                Fn::Sub: /${AWS::StackName}/cluster/password
+            - Name: SSM_VERSIONS
+              Value:
+                Fn::Sub: ${ClusterSecret}
+            - Name: HTTPS_PROXY
+              Value:
+                Fn::ImportValue:
+                  Fn::Sub: ${VpcName}ProxyUrl
+            - Name: AWS_DEFAULT_REGION
+              Value:
+                Ref: AWS::Region
+            - Name: CLUSTER_GROUP_NAME
+              Value:
+                Ref: ApplicationCluster
+            - Name: CLUSTER_AWS_ENABLED
+              Value: "true"
+            - Name: CLUSTER_AWS_REGION
+              Value:
+                Ref: AWS::Region
+            - Name: CLUSTER_AWS_IAM_ROLE
+              Value: DEFAULT
+            - Name: CLUSTER_AWS_TAG_KEY
+              Value: hazelcast:group
+            - Name: CLUSTER_AWS_TAG_VALUE
+              Value:
+                Ref: ApplicationCluster
+            - Name: JAVA_TOOL_OPTIONS
+              Value:
+                Fn::Join: ["", [
+                  " -Xmx672m -XX:MaxMetaspaceSize=128m",
+                  " -Dhttp.proxyHost=", "Fn::ImportValue": { "Fn::Sub": "${VpcName}ProxyHost" },
+                  " -Dhttp.proxyPort=3128",
+                  " -Dhttps.proxyHost=", "Fn::ImportValue": { "Fn::Sub": "${VpcName}ProxyHost" },
+                  " -Dhttps.proxyPort=3128",
+                  " -Dhttp.nonProxyHosts='*.", "Fn::ImportValue": { "Fn::Sub": "${VpcName}VpcDomain" }, 
+                  "|169.254.*|localhost|127.*|[::1]'"
+                ] ]
+          Command: 
+            - java
+            - -jar
+            - /app/app.jar
+            - -server
+            - -cluster
+            - -Dvertx.hazelcast.config=/app/conf/cluster.xml
+            - -cluster-port=15703
+          PortMappings:
+            - ContainerPort: 15703
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group:
+                Fn::Sub: ${AWS::StackName}/ecs/PortfolioService/portfolio
+              awslogs-region:
+                Ref: AWS::Region
+              awslogs-stream-prefix: docker
+  DashboardTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      NetworkMode: host
+      ContainerDefinitions:
+        - Name: dashboard
+          Image: 
+            Fn::Sub: ${MicrotraderImage}/microtrader-dashboard:${MicrotraderImageTag}
+          MemoryReservation: 195
+          Memory: 800
+          Cpu: 200
+          Environment:
+            - Name: SSM_SECRETS
+              Value:
+                Fn::Sub: /${AWS::StackName}/cluster/password
+            - Name: SSM_VERSIONS
+              Value:
+                Fn::Sub: ${ClusterSecret}
+            - Name: HTTPS_PROXY
+              Value:
+                Fn::ImportValue:
+                  Fn::Sub: ${VpcName}ProxyUrl
+            - Name: AWS_DEFAULT_REGION
+              Value:
+                Ref: AWS::Region
+            - Name: HTTP_PORT
+              Value:
+                Ref: MicrotraderDashboardHttpPort
+            - Name: CLUSTER_GROUP_NAME
+              Value:
+                Ref: ApplicationCluster
+            - Name: CLUSTER_AWS_ENABLED
+              Value: "true"
+            - Name: CLUSTER_AWS_REGION
+              Value:
+                Ref: AWS::Region
+            - Name: CLUSTER_AWS_IAM_ROLE
+              Value: DEFAULT
+            - Name: CLUSTER_AWS_TAG_KEY
+              Value: hazelcast:group
+            - Name: CLUSTER_AWS_TAG_VALUE
+              Value:
+                Ref: ApplicationCluster
+            - Name: JAVA_TOOL_OPTIONS
+              Value:
+                Fn::Join: ["", [
+                  " -Xmx672m -XX:MaxMetaspaceSize=128m",
+                  " -Dhttp.proxyHost=", "Fn::ImportValue": { "Fn::Sub": "${VpcName}ProxyHost" },
+                  " -Dhttp.proxyPort=3128",
+                  " -Dhttps.proxyHost=", "Fn::ImportValue": { "Fn::Sub": "${VpcName}ProxyHost" },
+                  " -Dhttps.proxyPort=3128",
+                  " -Dhttp.nonProxyHosts='*.", "Fn::ImportValue": { "Fn::Sub": "${VpcName}VpcDomain" }, 
+                  "|169.254.*|localhost|127.*|[::1]'"
+                ] ]
+          Command: 
+            - java
+            - -jar
+            - /app/app.jar
+            - -server
+            - -cluster
+            - -Dvertx.hazelcast.config=/app/conf/cluster.xml
+            - -cluster-port=15702
+          PortMappings:
+            - ContainerPort:
+                Ref: MicrotraderDashboardHttpPort
+            - ContainerPort: 15702
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group:
+                Fn::Sub: ${AWS::StackName}/ecs/DashboardService/dashboard
+              awslogs-region:
+                Ref: AWS::Region
+              awslogs-stream-prefix: docker
+  QuoteTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      NetworkMode: host
+      ContainerDefinitions:
+        - Name: quote
+          Image:
+            Fn::Sub: ${MicrotraderImage}/microtrader-quote:${MicrotraderImageTag}
+          MemoryReservation: 195
+          Memory: 800
+          Cpu: 200
+          Command:
+            - java
+            - -jar
+            - /app/app.jar
+            - -server
+            - -cluster
+            - -Dvertx.hazelcast.config=/app/conf/cluster.xml
+            - -cluster-port=15701
+          PortMappings:
+            - ContainerPort:
+                Ref: MicrotraderQuoteHttpPort
+            - ContainerPort: 15701
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group:
+                Fn::Sub: ${AWS::StackName}/ecs/QuoteService/quote
+              awslogs-region:
+                Ref: AWS::Region
+              awslogs-stream-prefix: docker
+          Environment:
+            - Name: MARKET_PERIOD
+              Value: 3000
+            - Name: SSM_SECRETS
+              Value:
+                Fn::Sub: /${AWS::StackName}/cluster/password
+            - Name: SSM_VERSIONS
+              Value:
+                Fn::Sub: ${ClusterSecret}
+            - Name: HTTPS_PROXY
+              Value:
+                Fn::ImportValue:
+                  Fn::Sub: ${VpcName}ProxyUrl
+            - Name: AWS_DEFAULT_REGION
+              Value:
+                Ref: AWS::Region
+            - Name: HTTP_PORT
+              Value:
+                Ref: MicrotraderQuoteHttpPort
+            - Name: HTTP_ROOT
+              Value: /quote/
+            - Name: HTTP_HOST
+              Value:
+                Ref: ApplicationDnsRecord
+            - Name: HTTP_PUBLIC_PORT
+              Value: 80
+            - Name: CLUSTER_AWS_ENABLED
+              Value: "true"
+            - Name: CLUSTER_AWS_REGION
+              Value:
+                Ref: AWS::Region
+            - Name: CLUSTER_AWS_IAM_ROLE
+              Value: DEFAULT
+            - Name: CLUSTER_AWS_TAG_KEY
+              Value: hazelcast:group
+            - Name: CLUSTER_AWS_TAG_VALUE
+              Value:
+                Ref: ApplicationCluster
+            - Name: CLUSTER_GROUP_NAME
+              Value:
+                Ref: ApplicationCluster
+            - Name: JAVA_TOOL_OPTIONS
+              Value:
+                Fn::Join: ["", [
+                  " -Xmx672m -XX:MaxMetaspaceSize=128m",
+                  " -Dhttp.proxyHost=", "Fn::ImportValue": { "Fn::Sub": "${VpcName}ProxyHost" },
+                  " -Dhttp.proxyPort=3128",
+                  " -Dhttps.proxyHost=", "Fn::ImportValue": { "Fn::Sub": "${VpcName}ProxyHost" },
+                  " -Dhttps.proxyPort=3128",
+                  " -Dhttp.nonProxyHosts='*.", "Fn::ImportValue": { "Fn::Sub": "${VpcName}VpcDomain" }, 
+                  "|169.254.*|localhost|127.*|[::1]'"
+                ] ]
+  ApplicationCluster:
+    Type: AWS::ECS::Cluster
+  DashboardServiceLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    Properties:
+      LogGroupName:
+        Fn::Sub: ${AWS::StackName}/ecs/DashboardService/dashboard
+      RetentionInDays:
+        Ref: LogRetention
+  PortfolioServiceLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    Properties:
+      LogGroupName:
+        Fn::Sub: ${AWS::StackName}/ecs/PortfolioService/portfolio
+      RetentionInDays:
+        Ref: LogRetention
+  AuditServiceLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    Properties:
+      LogGroupName:
+        Fn::Sub: ${AWS::StackName}/ecs/AuditService/audit
+      RetentionInDays:
+        Ref: LogRetention
+  QuoteServiceLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    Properties:
+      LogGroupName:
+        Fn::Sub: ${AWS::StackName}/ecs/QuoteService/quote
+      RetentionInDays:
+        Ref: LogRetention
+  DmesgLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    Properties:
+      LogGroupName: 
+        Fn::Sub: ${AWS::StackName}/ec2/ApplicationAutoscaling/var/log/dmesg
+      RetentionInDays:
+        Ref: LogRetention
+  MessagesLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    Properties:
+      LogGroupName: 
+        Fn::Sub: ${AWS::StackName}/ec2/ApplicationAutoscaling/var/log/messages
+      RetentionInDays:
+        Ref: LogRetention
+  DockerLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    Properties:
+      LogGroupName: 
+        Fn::Sub: ${AWS::StackName}/ec2/ApplicationAutoscaling/var/log/docker
+      RetentionInDays:
+        Ref: LogRetention
+  EcsAgentLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    Properties:
+      LogGroupName: 
+        Fn::Sub: ${AWS::StackName}/ec2/ApplicationAutoscaling/var/log/ecs/ecs-agent
+      RetentionInDays:
+        Ref: LogRetention
+  EcsInitLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    Properties:
+      LogGroupName: 
+        Fn::Sub: ${AWS::StackName}/ec2/ApplicationAutoscaling/var/log/ecs/ecs-init
+      RetentionInDays:
+        Ref: LogRetention
+  ApplicationAutoscalingToApplicationDatabaseEgress:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      IpProtocol: tcp
+      FromPort: 3306
+      ToPort: 3306
+      GroupId:
+        Ref: ApplicationAutoscalingSecurityGroup
+      DestinationSecurityGroupId:
+        Ref: ApplicationDatabaseSecurityGroup
+  ApplicationAutoscalingToApplicationDatabaseIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      IpProtocol: tcp
+      FromPort: 3306
+      ToPort: 3306
+      GroupId:
+        Ref: ApplicationDatabaseSecurityGroup
+      SourceSecurityGroupId:
+        Ref: ApplicationAutoscalingSecurityGroup
+  ApplicationDatabaseSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Application Database Security Group
+      VpcId: 
+        Fn::ImportValue: 
+          Fn::Sub: ${VpcName}VpcId
+      SecurityGroupIngress: []
+      SecurityGroupEgress:
+        - IpProtocol: icmp
+          FromPort: -1
+          ToPort: -1
+          CidrIp: 192.0.2.0/32
+      Tags:
+        - Key: Name
+          Value: 
+            Fn::Sub: ${AWS::StackName}-ApplicationDatabaseSecurityGroup
+  ApplicationDatabaseSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Application Database Subnet Group
+      SubnetIds:
+        - Fn::ImportValue: 
+            Fn::Sub: ${VpcName}HighSubnetA
+        - Fn::ImportValue: 
+            Fn::Sub: ${VpcName}HighSubnetB
+      Tags:
+        - Key: Name
+          Value: 
+            Fn::Sub: ${AWS::StackName}-ApplicationDatabaseSubnetGroup
+  ApplicationDatabase:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Snapshot
+    Properties:
+      Engine: MySQL
+      EngineVersion: 5.7
+      DBInstanceClass:
+        Ref: DatabaseInstanceType
+      AllocatedStorage: 10
+      StorageType: gp2
+      MasterUsername:
+        Ref: DatabaseUsername
+      MasterUserPassword:
+        Fn::Sub: ${DatabaseSecret.Value}
+      DBName:
+        Ref: DatabaseName
+      VPCSecurityGroups:
+        - Ref: ApplicationDatabaseSecurityGroup
+      DBSubnetGroupName:
+        Ref: ApplicationDatabaseSubnetGroup
+      MultiAZ:
+        Ref: DatabaseMultiAZ
+      AvailabilityZone: 
+        Fn::If:
+          - DatabaseSingleAZCondition
+          - Fn::Sub: ${AWS::Region}a
+          - Ref: AWS::NoValue
+  ApplicationDnsRecord:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      Name:
+        Fn::Join:
+          - ""
+          - - Fn::Sub: ${ApplicationDnsName}.
+            - Fn::ImportValue:
+                Fn::Sub: ${VpcName}VpcDomain
+      TTL: "300"
+      HostedZoneName:
+        Fn::Join:
+          - ""
+          - - Fn::ImportValue:
+                Fn::Sub: ${VpcName}VpcDomain
+            - "."
+      Type: CNAME
+      Comment: 
+        Fn::Sub: ${AWS::StackName} Application Record
+      ResourceRecords:
+        - Fn::Sub: ${ApplicationLoadBalancer.DNSName}
+  MicrotraderToApplicationLoadBalancerEgress:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      IpProtocol: tcp
+      FromPort: 80
+      ToPort: 80
+      GroupId:
+        Ref: ApplicationAutoscalingSecurityGroup
+      DestinationSecurityGroupId:
+        Ref: ApplicationLoadBalancerSecurityGroup
+  MicrotraderToApplicationLoadBalancerIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      IpProtocol: tcp
+      FromPort: 80
+      ToPort: 80
+      GroupId:
+        Ref: ApplicationLoadBalancerSecurityGroup
+      SourceSecurityGroupId:
+        Ref: ApplicationAutoscalingSecurityGroup
+  ApplicationLoadBalancerToMicrotraderAuditEgress:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      IpProtocol: tcp
+      FromPort:
+        Ref: MicrotraderAuditHttpPort
+      ToPort:
+        Ref: MicrotraderAuditHttpPort
+      GroupId:
+        Ref: ApplicationLoadBalancerSecurityGroup
+      DestinationSecurityGroupId:
+        Ref: ApplicationAutoscalingSecurityGroup
+  ApplicationLoadBalancerToMicrotraderAuditIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      IpProtocol: tcp
+      FromPort:
+        Ref: MicrotraderAuditHttpPort
+      ToPort:
+        Ref: MicrotraderAuditHttpPort
+      GroupId:
+        Ref: ApplicationAutoscalingSecurityGroup
+      SourceSecurityGroupId:
+        Ref: ApplicationLoadBalancerSecurityGroup
+  ApplicationLoadBalancerToMicrotraderQuoteEgress:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      IpProtocol: tcp
+      FromPort:
+        Ref: MicrotraderQuoteHttpPort
+      ToPort:
+        Ref: MicrotraderQuoteHttpPort
+      GroupId:
+        Ref: ApplicationLoadBalancerSecurityGroup
+      DestinationSecurityGroupId:
+        Ref: ApplicationAutoscalingSecurityGroup
+  ApplicationLoadBalancerToMicrotraderQuoteIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      IpProtocol: tcp
+      FromPort:
+        Ref: MicrotraderQuoteHttpPort
+      ToPort:
+        Ref: MicrotraderQuoteHttpPort
+      GroupId:
+        Ref: ApplicationAutoscalingSecurityGroup
+      SourceSecurityGroupId:
+        Ref: ApplicationLoadBalancerSecurityGroup
+  ApplicationLoadBalancerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Application Load Balancer Security Group
+      VpcId:
+        Fn::ImportValue:
+          Fn::Sub: ${VpcName}VpcId
+      SecurityGroupIngress: []
+      SecurityGroupEgress: []
+      Tags:
+        - Key: Name
+          Value: 
+            Fn::Sub: ${AWS::StackName}-PublicLoadBalancerSecurityGroup
+  QuoteServiceTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      VpcId:
+        Fn::ImportValue: 
+          Fn::Sub: ${VpcName}VpcId
+      HealthCheckPath: /quote/
+      Protocol: HTTP
+      Port:
+        Ref: MicrotraderQuoteHttpPort
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: 30
+  AuditServiceTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      VpcId:
+        Fn::ImportValue: 
+          Fn::Sub: ${VpcName}VpcId
+      HealthCheckPath: /audit/
+      Protocol: HTTP
+      Port:
+        Ref: MicrotraderAuditHttpPort
+      TargetGroupAttributes: 
+        - Key: deregistration_delay.timeout_seconds
+          Value: 30
+  AuditServiceListenerRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      Priority: 1
+      ListenerArn:
+        Ref: ApplicationLoadBalancerHttpListener
+      Conditions:
+        - Field: path-pattern
+          Values:
+            - Fn::Sub: /audit/*
+      Actions:
+        - TargetGroupArn:
+            Ref: AuditServiceTargetGroup
+          Type: forward
+  ApplicationLoadBalancerHttpListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn:
+        Ref: ApplicationLoadBalancer
+      Protocol: HTTP
+      Port: 80
+      DefaultActions:
+        - TargetGroupArn:
+            Ref: QuoteServiceTargetGroup
+          Type: forward
+  ApplicationLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Scheme: internal
+      Subnets:
+        - Fn::ImportValue: 
+            Fn::Sub: ${VpcName}MediumSubnetA
+        - Fn::ImportValue: 
+            Fn::Sub: ${VpcName}MediumSubnetB
+      SecurityGroups:
+        - Ref: ApplicationLoadBalancerSecurityGroup
+      LoadBalancerAttributes:
+        - Key: deletion_protection.enabled
+          Value: "false"
+        - Key: idle_timeout.timeout_seconds
+          Value : 30
+      Tags:
+        - Key: Name
+          Value: 
+            Fn::Sub: ${AWS::StackName}-ApplicationLoadBalancer
+  PublicLoadBalancerHttpListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn:
+        Ref: PublicLoadBalancer
+      Protocol: HTTP
+      Port: 80
+      DefaultActions:
+        - TargetGroupArn:
+            Ref: DashboardServiceTargetGroup
+          Type: forward
+  DashboardServiceTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Protocol: HTTP
+      Port:
+        Ref: MicrotraderDashboardHttpPort
+      VpcId:
+        Fn::ImportValue:
+          Fn::Sub: ${VpcName}VpcId
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: 30
+  PublicLoadBalancerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Public Load Balancer Security Group
+      VpcId:
+        Fn::ImportValue: 
+          Fn::Sub: ${VpcName}VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: 
+            Fn::Sub: ${AWS::StackName}-PublicLoadBalancerSecurityGroup
+  PublicLoadBalancerToMicrotraderDashboardEgress:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      IpProtocol: tcp
+      FromPort:
+        Ref: MicrotraderDashboardHttpPort
+      ToPort:
+        Ref: MicrotraderDashboardHttpPort
+      DestinationSecurityGroupId:
+        Ref: ApplicationAutoscalingSecurityGroup
+      GroupId:
+        Ref: PublicLoadBalancerSecurityGroup
+  PublicLoadBalancerToMicrotraderDashboardIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      IpProtocol: tcp
+      FromPort:
+        Ref: MicrotraderDashboardHttpPort
+      ToPort:
+        Ref: MicrotraderDashboardHttpPort
+      SourceSecurityGroupId:
+        Ref: PublicLoadBalancerSecurityGroup
+      GroupId:
+        Ref: ApplicationAutoscalingSecurityGroup
+  PublicLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Scheme: internet-facing
+      Subnets:
+        - Fn::ImportValue:
+            Fn::Sub: ${VpcName}PublicSubnetA
+        - Fn::ImportValue:
+            Fn::Sub: ${VpcName}PublicSubnetB
+      LoadBalancerAttributes:
+        - Key: deletion_protection.enabled
+          Value: "false"
+        - Key: idle_timeout.timeout_seconds
+          Value: 30
+      SecurityGroups:
+        - Ref: PublicLoadBalancerSecurityGroup
+      Tags:
+        - Key: Name
+          Value:
+            Fn::Sub: ${AWS::StackName}-PublicLoadBalancer
+  ApplicationAutoscalingInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - Ref: ApplicationAutoscalingInstanceRole
+  ApplicationAutoscalingInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: SSMSecrets
+          PolicyDocument: 
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                - ssm:GetParameters
+                Resource:
+                  - Fn::Sub: arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${AWS::StackName}/*
+              - Effect: Allow
+                Action:
+                - kms:Decrypt
+                Resource:
+                  Fn::ImportValue: CfnMasterKeyArn
+        - PolicyName: ECSContainerInstancePolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ecs:RegisterContainerInstance
+                  - ecs:DeregisterContainerInstance
+                Resource:
+                  Fn::Sub: arn:aws:ecs:${AWS::Region}:${AWS::AccountId}:cluster/${ApplicationCluster}
+              - Effect: Allow
+                Action:
+                  - ecs:DiscoverPollEndpoint
+                  - ecs:Submit*
+                  - ecs:Poll
+                  - ecs:StartTelemetrySession
+                Resource: "*"
+              - Effect: Allow
+                Action: 
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:BatchGetImage
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:GetAuthorizationToken
+                Resource: "*"
+        - PolicyName: HazelcastClusterDiscoveryPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              Action: ec2:DescribeInstances
+              Resource: "*"
+              Effect: Allow
+        - PolicyName: CloudwatchLogsPolicy
+          PolicyDocument: 
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                - logs:CreateLogGroup
+                - logs:CreateLogStream
+                - logs:PutLogEvents
+                - logs:DescribeLogStreams
+                Resource:
+                  Fn::Sub: arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:${AWS::StackName}*
+  ApplicationAutoscalingLaunchConfiguration:
+    Type: AWS::AutoScaling::LaunchConfiguration
+    Metadata:
+      AWS::CloudFormation::Init:
+        config:
+          commands:
+            10_first_run:
+              command: sh firstrun.sh
+              cwd: /home/ec2-user
+              env:
+                STACK_NAME:
+                  Ref: AWS::StackName
+                AUTOSCALING_GROUP: ApplicationAutoscaling
+                AWS_DEFAULT_REGION:
+                  Ref: AWS::Region
+                ECS_CLUSTER:
+                  Ref: ApplicationCluster
+                PROXY_URL:
+                  Fn::ImportValue:
+                    Fn::Sub: ${VpcName}ProxyUrl
+                DOCKER_NETWORK_MODE: host
+    Properties:
+      ImageId:
+        Ref: ApplicationImageId
+      InstanceType:
+        Ref: ApplicationInstanceType
+      KeyName:
+        Ref: ApplicationKeyName
+      IamInstanceProfile:
+        Ref: ApplicationAutoscalingInstanceProfile
+      SecurityGroups:
+        - Ref: ApplicationAutoscalingSecurityGroup
+      UserData:
+        Fn::Base64:
+          Fn::Join: ["", [
+            "#!/bin/bash\n",
+            "/opt/aws/bin/cfn-init -v ",
+            "    --stack ", { "Ref" : "AWS::StackName" },
+            "    --resource ApplicationAutoscalingLaunchConfiguration ",
+            "    --region ", { "Ref" : "AWS::Region" },
+            "    --http-proxy ", "Fn::ImportValue": { "Fn::Sub": "${VpcName}ProxyUrl" },
+            "    --https-proxy ", "Fn::ImportValue": { "Fn::Sub": "${VpcName}ProxyUrl" },
+            "\n",
+            "/opt/aws/bin/cfn-signal -e $? --stack ", { "Ref" : "AWS::StackName" },
+            "    --resource ApplicationAutoscaling ",
+            "    --region ", { "Ref" : "AWS::Region" },
+            "    --http-proxy ", "Fn::ImportValue": { "Fn::Sub": "${VpcName}ProxyUrl" },
+            "    --https-proxy ", "Fn::ImportValue": { "Fn::Sub": "${VpcName}ProxyUrl" },
+            "\n",
+          ] ]
+  ApplicationAutoscaling:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    DependsOn:
+      - DmesgLogGroup
+      - MessagesLogGroup
+      - DockerLogGroup
+      - EcsInitLogGroup
+      - EcsAgentLogGroup
+    UpdatePolicy:
+      AutoScalingRollingUpdate:
+        SuspendProcesses:
+          - HealthCheck
+          - ReplaceUnhealthy
+          - AZRebalance
+          - AlarmNotification
+          - ScheduledActions
+        MinInstancesInService:
+          Ref: ApplicationDesiredCount
+        MinSuccessfulInstancesPercent: 100
+        WaitOnResourceSignals: "true"
+        PauseTime: PT15M 
+    CreationPolicy:
+      ResourceSignal:
+        Count:
+          Ref: ApplicationDesiredCount
+        Timeout: PT15M
+    Properties:
+      LaunchConfigurationName:
+        Ref: ApplicationAutoscalingLaunchConfiguration
+      MinSize: 0
+      MaxSize: 4
+      DesiredCapacity:
+        Ref: ApplicationDesiredCount
+      VPCZoneIdentifier:
+        - Fn::ImportValue:
+            Fn::Sub: ${VpcName}MediumSubnetA    
+        - Fn::ImportValue:
+            Fn::Sub: ${VpcName}MediumSubnetB
+      Tags:
+        - Key: Name
+          Value: 
+            Fn::Sub: ${AWS::StackName}-ApplicationAutoscaling-instance
+          PropagateAtLaunch: "true"
+        - Key: hazelcast:group
+          Value:
+            Ref: ApplicationCluster
+          PropagateAtLaunch: "true"
+  MicrotraderClusterDiscoverIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      IpProtocol: tcp
+      FromPort: 5701
+      ToPort: 5710
+      SourceSecurityGroupId:
+        Ref: ApplicationAutoscalingSecurityGroup
+      GroupId:
+        Ref: ApplicationAutoscalingSecurityGroup
+  MicrotraderClusterDiscoverEgress:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      IpProtocol: tcp
+      FromPort: 5701
+      ToPort: 5710
+      DestinationSecurityGroupId:
+        Ref: ApplicationAutoscalingSecurityGroup
+      GroupId:
+        Ref: ApplicationAutoscalingSecurityGroup
+  MicrotraderEventBusIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      IpProtocol: tcp
+      FromPort: 15701
+      ToPort: 15704
+      SourceSecurityGroupId:
+        Ref: ApplicationAutoscalingSecurityGroup
+      GroupId:
+        Ref: ApplicationAutoscalingSecurityGroup
+  MicrotraderEventBusEgress:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      IpProtocol: tcp
+      FromPort: 15701
+      ToPort: 15704
+      DestinationSecurityGroupId:
+        Ref: ApplicationAutoscalingSecurityGroup
+      GroupId:
+        Ref: ApplicationAutoscalingSecurityGroup
+  ApplicationAutoscalingSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription:
+        Fn::Sub: ${AWS::StackName} Application Autoscaling Security Group
+      VpcId:
+        Fn::ImportValue:
+          Fn::Sub: ${VpcName}VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp:
+            Fn::ImportValue:
+              Fn::Sub: ${VpcName}VpcCidr
+      SecurityGroupEgress:
+        - IpProtocol: udp
+          FromPort: 53
+          ToPort: 53
+          CidrIp:
+            Fn::Join: ["", [ "Fn::ImportValue": { "Fn::Sub": "${VpcName}VpcDnsServer" }, "/32" ] ]
+        - IpProtocol: tcp
+          FromPort: 3128
+          ToPort: 3128
+          DestinationSecurityGroupId:
+            Fn::ImportValue:
+              Fn::Sub: ${VpcName}ProxySecurityGroup
+
+Outputs:
+  PublicLoadBalancerUrl:
+    Description: Public Load Balancer URL
+    Value:
+      Fn::Sub: ${PublicLoadBalancer.DNSName}
