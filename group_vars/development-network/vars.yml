@@ -1,0 +1,11 @@
+# STS role and target account
+Sts.Role: arn:aws:iam::228697802149:role/admin
+
+Stack.Name: microtrader-development-network
+Stack.Description: Microtrader newtwork Stack - Development
+Stack.Template: templates/network.yml.j2
+
+Config.Vpcs:
+  Default:
+    Cidr: 192.168.0.0/20
+    Domain: my-example-app.internal

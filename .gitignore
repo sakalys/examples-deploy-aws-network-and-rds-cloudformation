@@ -4,3 +4,4 @@ roles/*
 *.retry
 *.pyc
 .idea
+venv

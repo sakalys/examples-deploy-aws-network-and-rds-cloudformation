@@ -3,3 +3,5 @@ development ansible_connection=local
 
 [production]
 production ansible_connection=local
+[development-network]
+development-network ansible_connection=local
